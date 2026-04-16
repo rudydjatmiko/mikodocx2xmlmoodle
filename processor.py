@@ -2,48 +2,49 @@ import re
 import base64
 import io
 import xml.etree.ElementTree as ET
-from xml.dom import minidom
 from docx2python import docx2python
 from PIL import Image
 
+# Pre-compile Regex untuk kecepatan eksekusi
+RE_OPTION = re.compile(r'^[A-E][\.\)]')
+RE_IMAGE = re.compile(r'----(image\d+\.\w+)----')
+RE_CLEAN_HTML = re.compile(r'<[^<]+?>')
+
 def cdata(text):
-    """Membungkus teks dalam CDATA agar aman bagi Moodle (untuk Arab & Rumus)."""
+    """Membungkus teks dalam CDATA agar aman untuk Moodle."""
     return f"<![CDATA[{text}]]>"
 
 def optimize_image(image_bytes, max_width=600):
-    """Mengecilkan resolusi gambar agar ukuran file XML tidak terlalu besar."""
+    """Mengecilkan resolusi gambar untuk performa XML yang ringan."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        # Konversi ke RGB jika formatnya RGBA (agar bisa disave ke JPEG)
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
         
-        # Hitung proporsi
-        w_percent = (max_width / float(img.size[0]))
-        if w_percent < 1.0:
+        # Resize hanya jika gambar terlalu besar
+        if img.size[0] > max_width:
+            w_percent = (max_width / float(img.size[0]))
             h_size = int((float(img.size[1]) * float(w_percent)))
             img = img.resize((max_width, h_size), Image.Resampling.LANCZOS)
         
-        # Simpan ke format JPEG dengan kualitas 70%
         buffer = io.BytesIO()
+        # Menggunakan JPEG untuk kompresi maksimal (kecil & cepat)
         img.save(buffer, format="JPEG", quality=70, optimize=True)
         return buffer.getvalue(), "jpg"
-    except Exception:
-        # Jika gagal optimasi, return data asli
+    except:
         return image_bytes, "png"
 
 def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
-    # Membersihkan nama kategori dari nama file
-    category_name = filename.replace('.docx', '').replace('.doc', '').strip()
+    category_name = filename.rsplit('.', 1)[0].strip()
     
-    # Ekstraksi konten dengan docx2python (html=True untuk menjaga format Bold/Italic/Table)
+    # docx2python sangat efektif membaca tabel & textbox
     with docx2python(docx_file_bytes, html=True) as doc_content:
         content = doc_content.body
         images_dict = doc_content.images
         
         quiz = ET.Element('quiz')
 
-        # 1. HEADER KATEGORI
+        # 1. KATEGORI (Sesuai file referensi)
         cat_q = ET.SubElement(quiz, 'question', type='category')
         cat_node = ET.SubElement(cat_q, 'category')
         ET.SubElement(cat_node, 'text').text = f"$course$/{category_name}"
@@ -52,7 +53,7 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
         current_q = None
         q_counter = 1
 
-        # Pemindaian konten dokumen
+        # Pemindaian dokumen secara linear (Efektif & Cepat)
         for sheet in content:
             for table in sheet:
                 for row in table:
@@ -61,9 +62,8 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
                             text = paragraph.strip()
                             if not text: continue
 
-                            # LOGIKA DETEKSI SOAL
-                            # Bukan pilihan (A-E) dan bukan Kunci Jawaban (ANS:)
-                            if not re.match(r'^[A-E][\.\)]', text) and not text.startswith('ANS:'):
+                            # Deteksi SOAL (Autonumbering Level 0)
+                            if not RE_OPTION.match(text) and not text.startswith('ANS:'):
                                 if current_q: questions.append(current_q)
                                 
                                 q_type = 'essay' if 'ESSAY' in text.upper() else 'multichoice'
@@ -75,57 +75,53 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
                                     'type': q_type
                                 }
 
-                            # LOGIKA DETEKSI PILIHAN
-                            elif re.match(r'^[A-E][\.\)]', text) and current_q:
-                                clean_opt = re.sub(r'^[A-E][\.\)]', '', text).strip()
+                            # Deteksi PILIHAN (Autonumbering Level 1)
+                            elif RE_OPTION.match(text) and current_q:
+                                clean_opt = RE_OPTION.sub('', text).strip()
                                 current_q['options'].append(clean_opt)
 
-                            # LOGIKA DETEKSI KUNCI
+                            # Deteksi KUNCI
                             elif text.startswith('ANS:') and current_q:
                                 current_q['answer'] = text.replace('ANS:', '').strip().upper()
 
-                            # LOGIKA DETEKSI GAMBAR
+                            # Deteksi Gambar
                             if '----image' in text and current_q:
-                                img_refs = re.findall(r'----(image\d+\.\w+)----', text)
+                                img_refs = RE_IMAGE.findall(text)
                                 for ref in img_refs:
                                     if ref in images_dict:
                                         current_q['images'].append((ref, images_dict[ref]))
 
         if current_q: questions.append(current_q)
 
-        # 2. KONSTRUKSI TIAP SOAL KE XML
+        # 2. PEMBUATAN XML (Optimasi Kecepatan)
         for q in questions:
             q_node = ET.SubElement(quiz, 'question', type=q['type'])
             
-            # Name: Sesuai file referensi [PREFIX] q01 [SNIPPET]
+            # Format Nama Soal: [FILE] q01 [SNIPPET]
             q_id = f"q{str(q_counter).zfill(2)}"
-            # Hapus tag HTML dari snippet nama agar XML valid
-            clean_snippet = re.sub('<[^<]+?>', '', q['text'])[:50]
-            q_name_text = f"{category_name} {q_id} {clean_snippet}"
-            ET.SubElement(ET.SubElement(q_node, 'name'), 'text').text = cdata(q_name_text)
+            clean_snippet = RE_CLEAN_HTML.sub('', q['text'])[:50]
+            ET.SubElement(ET.SubElement(q_node, 'name'), 'text').text = cdata(f"{category_name} {q_id} {clean_snippet}")
 
-            # Question Text
             qtext_tag = ET.SubElement(q_node, 'questiontext', format='html')
             
-            # Proses Gambar & Teks (Support Arab dir=auto)
+            # HTML Body dengan support Arab (dir=auto)
             html_body = f"<p dir='auto'>{q['text']}</p>"
             
             for img_name, img_bytes in q['images']:
-                # Kompres gambar sebelum diencode
                 opt_bytes, ext = optimize_image(img_bytes)
                 new_img_name = f"{q_id}_{img_name.split('.')[0]}.{ext}"
                 
-                # Ganti placeholder di text dengan tag img
+                # Masukkan Tag Image standar Moodle
                 img_html = f'<br /><img src="@@PLUGINFILE@@/{new_img_name}" border="0" /><br />'
                 html_body = html_body.replace(f'----{img_name}----', img_html)
                 
-                # Masukkan file binary (Base64)
+                # Masukkan file binary Base64
                 file_node = ET.SubElement(qtext_tag, 'file', name=new_img_name, encoding="base64")
                 file_node.text = base64.b64encode(opt_bytes).decode()
 
             ET.SubElement(qtext_tag, 'text').text = cdata(html_body)
 
-            # Metadata Tambahan
+            # Metadata Standar (Penalty, Grade, dsb)
             ET.SubElement(q_node, 'defaultgrade').text = "1.0"
             
             if q['type'] == 'multichoice':
@@ -135,12 +131,10 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
                 ET.SubElement(q_node, 'shuffleanswers').text = "true"
                 ET.SubElement(q_node, 'answernumbering').text = "abc"
 
-                # Pilihan Jawaban
                 letters = ['A', 'B', 'C', 'D', 'E']
                 for i, opt in enumerate(q['options']):
-                    # Mendukung multiple answer jika kunci mengandung lebih dari 1 huruf
+                    # Pecah jawaban jika ada lebih dari satu (misal: A and C)
                     is_correct = "100.0" if (i < len(letters) and letters[i] in q['answer']) else "0.0"
-                    
                     ans_node = ET.SubElement(q_node, 'answer', fraction=is_correct, format="html")
                     ET.SubElement(ans_node, 'text').text = cdata(opt)
             
@@ -153,10 +147,8 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
 
             q_counter += 1
 
-        # 3. FINALISASI & HEADER GARY BLACKBURN
-        xml_string = ET.tostring(quiz, encoding='utf-8')
-        # Gunakan minidom hanya untuk merapikan spasi (indentasi)
-        pretty_xml = minidom.parseString(xml_string).toprettyxml(indent="  ")
+        # 3. FINALISASI (Tanpa Pretty Print untuk Kecepatan Maksimal)
+        xml_output = ET.tostring(quiz, encoding='utf-8').decode('utf-8')
         
         header_metadata = (
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -166,7 +158,4 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
             "\n"
         )
         
-        # Gabungkan dan hapus deklarasi XML ganda dari minidom
-        final_output = header_metadata + pretty_xml.replace('<?xml version="1.0" ?>', '').strip()
-        
-        return final_output
+        return header_metadata + xml_output
