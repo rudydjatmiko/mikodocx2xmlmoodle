@@ -1,25 +1,49 @@
 import re
 import base64
+import io
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from docx2python import docx2python
+from PIL import Image
 
 def cdata(text):
-    """Membungkus teks dalam CDATA agar aman untuk Moodle."""
+    """Membungkus teks dalam CDATA agar aman bagi Moodle (untuk Arab & Rumus)."""
     return f"<![CDATA[{text}]]>"
 
+def optimize_image(image_bytes, max_width=600):
+    """Mengecilkan resolusi gambar agar ukuran file XML tidak terlalu besar."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        # Konversi ke RGB jika formatnya RGBA (agar bisa disave ke JPEG)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        
+        # Hitung proporsi
+        w_percent = (max_width / float(img.size[0]))
+        if w_percent < 1.0:
+            h_size = int((float(img.size[1]) * float(w_percent)))
+            img = img.resize((max_width, h_size), Image.Resampling.LANCZOS)
+        
+        # Simpan ke format JPEG dengan kualitas 70%
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=70, optimize=True)
+        return buffer.getvalue(), "jpg"
+    except Exception:
+        # Jika gagal optimasi, return data asli
+        return image_bytes, "png"
+
 def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
-    # Hapus ekstensi dari nama file untuk kategori
-    category_name = filename.replace('.docx', '').replace('.doc', '')
+    # Membersihkan nama kategori dari nama file
+    category_name = filename.replace('.docx', '').replace('.doc', '').strip()
     
+    # Ekstraksi konten dengan docx2python (html=True untuk menjaga format Bold/Italic/Table)
     with docx2python(docx_file_bytes, html=True) as doc_content:
-        # doc_content.body[0] biasanya berisi tabel utama dokumen
         content = doc_content.body
         images_dict = doc_content.images
         
         quiz = ET.Element('quiz')
 
-        # 1. TAMBAHKAN KATEGORI (Sesuai file referensi)
+        # 1. HEADER KATEGORI
         cat_q = ET.SubElement(quiz, 'question', type='category')
         cat_node = ET.SubElement(cat_q, 'category')
         ET.SubElement(cat_node, 'text').text = f"$course$/{category_name}"
@@ -28,7 +52,7 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
         current_q = None
         q_counter = 1
 
-        # Flatten structure dari docx2python (Sheets > Tables > Rows > Cells > Paragraphs)
+        # Pemindaian konten dokumen
         for sheet in content:
             for table in sheet:
                 for row in table:
@@ -37,14 +61,12 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
                             text = paragraph.strip()
                             if not text: continue
 
-                            # DETEKSI SOAL (Bukan pilihan A-E dan bukan ANS:)
-                            # Menangani autonumbering atau teks biasa sebagai soal
+                            # LOGIKA DETEKSI SOAL
+                            # Bukan pilihan (A-E) dan bukan Kunci Jawaban (ANS:)
                             if not re.match(r'^[A-E][\.\)]', text) and not text.startswith('ANS:'):
-                                # Jika ada kata ESSAY, tandai sebagai tipe essay
-                                q_type = 'essay' if 'ESSAY' in text.upper() else 'multichoice'
-                                
                                 if current_q: questions.append(current_q)
                                 
+                                q_type = 'essay' if 'ESSAY' in text.upper() else 'multichoice'
                                 current_q = {
                                     'text': text,
                                     'options': [],
@@ -53,53 +75,57 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
                                     'type': q_type
                                 }
 
-                            # DETEKSI PILIHAN JAWABAN (A. B. C. D.)
+                            # LOGIKA DETEKSI PILIHAN
                             elif re.match(r'^[A-E][\.\)]', text) and current_q:
                                 clean_opt = re.sub(r'^[A-E][\.\)]', '', text).strip()
                                 current_q['options'].append(clean_opt)
 
-                            # DETEKSI KUNCI JAWABAN (ANS: B)
+                            # LOGIKA DETEKSI KUNCI
                             elif text.startswith('ANS:') and current_q:
-                                # Mengambil huruf setelah 'ANS:'
-                                current_q['answer'] = text.replace('ANS:', '').strip()
+                                current_q['answer'] = text.replace('ANS:', '').strip().upper()
 
-                            # DETEKSI PLACEHOLDER GAMBAR
+                            # LOGIKA DETEKSI GAMBAR
                             if '----image' in text and current_q:
-                                img_filenames = re.findall(r'----(image\d+\.\w+)----', text)
-                                for fname in img_filenames:
-                                    if fname in images_dict:
-                                        current_q['images'].append((fname, images_dict[fname]))
+                                img_refs = re.findall(r'----(image\d+\.\w+)----', text)
+                                for ref in img_refs:
+                                    if ref in images_dict:
+                                        current_q['images'].append((ref, images_dict[ref]))
 
         if current_q: questions.append(current_q)
 
-        # 2. KONSTRUKSI XML PER SOAL
+        # 2. KONSTRUKSI TIAP SOAL KE XML
         for q in questions:
             q_node = ET.SubElement(quiz, 'question', type=q['type'])
             
-            # Name: Format [CATEGORY] q01 [TEXT SNIPPET]
+            # Name: Sesuai file referensi [PREFIX] q01 [SNIPPET]
             q_id = f"q{str(q_counter).zfill(2)}"
-            q_name_text = f"{category_name} {q_id} {q['text'][:50]}..."
+            # Hapus tag HTML dari snippet nama agar XML valid
+            clean_snippet = re.sub('<[^<]+?>', '', q['text'])[:50]
+            q_name_text = f"{category_name} {q_id} {clean_snippet}"
             ET.SubElement(ET.SubElement(q_node, 'name'), 'text').text = cdata(q_name_text)
 
             # Question Text
-            qtext_node = ET.SubElement(q_node, 'questiontext', format='html')
+            qtext_tag = ET.SubElement(q_node, 'questiontext', format='html')
             
-            # Format HTML Soal (Mendukung Font Arab/Matematika via CDATA)
-            html_content = f"<p dir='auto'>{q['text']}</p>"
+            # Proses Gambar & Teks (Support Arab dir=auto)
+            html_body = f"<p dir='auto'>{q['text']}</p>"
             
-            # Masukkan Gambar jika ada
-            for img_name, img_data in q['images']:
-                # Moodle Path @@PLUGINFILE@@
-                img_tag = f'<br /><img src="@@PLUGINFILE@@/{img_name}" border="0" /><br />'
-                html_content = html_content.replace(f'----{img_name}----', img_tag)
+            for img_name, img_bytes in q['images']:
+                # Kompres gambar sebelum diencode
+                opt_bytes, ext = optimize_image(img_bytes)
+                new_img_name = f"{q_id}_{img_name.split('.')[0]}.{ext}"
                 
-                # Masukkan data Base64 tepat di bawah questiontext
-                file_node = ET.SubElement(qtext_node, 'file', name=img_name, encoding="base64")
-                file_node.text = base64.b64encode(img_data).decode()
+                # Ganti placeholder di text dengan tag img
+                img_html = f'<br /><img src="@@PLUGINFILE@@/{new_img_name}" border="0" /><br />'
+                html_body = html_body.replace(f'----{img_name}----', img_html)
+                
+                # Masukkan file binary (Base64)
+                file_node = ET.SubElement(qtext_tag, 'file', name=new_img_name, encoding="base64")
+                file_node.text = base64.b64encode(opt_bytes).decode()
 
-            ET.SubElement(qtext_node, 'text').text = cdata(html_content)
+            ET.SubElement(qtext_tag, 'text').text = cdata(html_body)
 
-            # Metadata Standar (Penalty, Grade, dsb)
+            # Metadata Tambahan
             ET.SubElement(q_node, 'defaultgrade').text = "1.0"
             
             if q['type'] == 'multichoice':
@@ -109,14 +135,14 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
                 ET.SubElement(q_node, 'shuffleanswers').text = "true"
                 ET.SubElement(q_node, 'answernumbering').text = "abc"
 
-                # Tambahkan Pilihan Jawaban
+                # Pilihan Jawaban
                 letters = ['A', 'B', 'C', 'D', 'E']
-                for i, opt_text in enumerate(q['options']):
-                    # Bandingkan huruf (A, B, C...) dengan isi current_q['answer']
+                for i, opt in enumerate(q['options']):
+                    # Mendukung multiple answer jika kunci mengandung lebih dari 1 huruf
                     is_correct = "100.0" if (i < len(letters) and letters[i] in q['answer']) else "0.0"
                     
                     ans_node = ET.SubElement(q_node, 'answer', fraction=is_correct, format="html")
-                    ET.SubElement(ans_node, 'text').text = cdata(opt_text)
+                    ET.SubElement(ans_node, 'text').text = cdata(opt)
             
             elif q['type'] == 'essay':
                 ET.SubElement(q_node, 'penalty').text = "0.1"
@@ -127,13 +153,12 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
 
             q_counter += 1
 
-        # 3. FORMATING AKHIR & HEADER METADATA
-        raw_xml = ET.tostring(quiz, encoding='utf-8')
-        reparsed = minidom.parseString(raw_xml)
-        pretty_xml = reparsed.toprettyxml(indent="  ")
-
-        # Tambahkan Header Komentar Gary Blackburn sesuai request
-        header_comment = (
+        # 3. FINALISASI & HEADER GARY BLACKBURN
+        xml_string = ET.tostring(quiz, encoding='utf-8')
+        # Gunakan minidom hanya untuk merapikan spasi (indentasi)
+        pretty_xml = minidom.parseString(xml_string).toprettyxml(indent="  ")
+        
+        header_metadata = (
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             "\n"
             "\n"
@@ -141,7 +166,7 @@ def process_docx_to_moodle(docx_file_bytes, filename="QUIZ"):
             "\n"
         )
         
-        # Gabungkan (Hapus deklarasi XML default dari minidom agar tidak double)
-        final_xml = header_comment + pretty_xml.replace('<?xml version="1.0" ?>', '').strip()
+        # Gabungkan dan hapus deklarasi XML ganda dari minidom
+        final_output = header_metadata + pretty_xml.replace('<?xml version="1.0" ?>', '').strip()
         
-        return final_xml
+        return final_output
