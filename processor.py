@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # ============ REGEX PATTERNS ============
 RE_OPTION = re.compile(r'^[A-E][\.\)]')
-RE_IMAGE = re.compile(r'----(image\d+\.\w+)----')
+RE_IMAGE = re.compile(r'----(image\d+(?:\.\w+)?(?:_\d+)?)----')
 RE_CLEAN_HTML = re.compile(r'<[^<]+?>')
 RE_SANITIZE_FILENAME = re.compile(r'[<>:"/\\|?*]')
 RE_INVALID_CHARS = re.compile(r'[<>&"\']')
@@ -163,18 +163,29 @@ def sanitize_filename(filename: str) -> str:
     return safe_name or "quiz"
 
 def sanitize_text(text: str, max_length: Optional[int] = None) -> str:
-    """Sanitize text content untuk XML"""
+    """
+    Sanitize text content untuk XML.
+    
+    PERBAIKAN #3: Konversi object ke string dan hapus karakter XML invalid
+    """
     if not text:
         return ""
     
-    text = text.strip()
+    # PERBAIKAN: Convert ke string jika object (dari docx2python)
+    text = str(text).strip()
     
-    # Remove invalid XML characters tapi keep HTML tags
-    # Keep hanya: alphanumeric, spaces, HTML tags, common punctuation
+    # Skip jika hanya whitespace
+    if not text or text.isspace():
+        return ""
+    
+    # PERBAIKAN: Remove invalid XML characters (< > & " ')
+    # tapi keep angka, huruf, spasi, dan tanda baca umum
+    text = RE_INVALID_CHARS.sub('', text)
+    
     if max_length:
         text = text[:max_length]
     
-    return text
+    return text.strip()
 
 def validate_answer_format(answer_str: str) -> str:
     """
@@ -205,6 +216,10 @@ def parse_docx_to_questions(
     """
     Parse DOCX content ke struktur questions.
     
+    PERBAIKAN: 
+    - Handle berbagai struktur DOCX
+    - Robust error handling untuk malformed content
+    
     Returns:
         List of question dictionaries
     """
@@ -212,52 +227,83 @@ def parse_docx_to_questions(
     current_q = None
     
     try:
-        for sheet in content:
-            for table in sheet:
-                for row in table:
-                    for cell in row:
-                        for paragraph in cell:
-                            text = sanitize_text(paragraph)
+        for sheet_idx, sheet in enumerate(content):
+            try:
+                for table_idx, table in enumerate(sheet):
+                    try:
+                        for row_idx, row in enumerate(table):
+                            try:
+                                for cell_idx, cell in enumerate(row):
+                                    # PERBAIKAN: Handle berbagai tipe cell content
+                                    if cell is None:
+                                        continue
+                                    
+                                    # Iterasi paragraf dalam cell
+                                    try:
+                                        paragraphs = cell if isinstance(cell, (list, tuple)) else [cell]
+                                    except (TypeError, ValueError):
+                                        paragraphs = [cell]
+                                    
+                                    for para_idx, paragraph in enumerate(paragraphs):
+                                        try:
+                                            # PERBAIKAN #1: Convert object ke string
+                                            text = sanitize_text(paragraph)
+                                            
+                                            if not text:
+                                                continue
+                                            
+                                            # Deteksi soal baru (bukan opsi dan bukan jawaban)
+                                            if not RE_OPTION.match(text) and not text.startswith('ANS:'):
+                                                if current_q:
+                                                    # Validasi soal sebelum append
+                                                    if validate_question(current_q, stats):
+                                                        questions.append(current_q)
+                                                
+                                                q_type = 'essay' if 'ESSAY' in text.upper() else 'multichoice'
+                                                current_q = {
+                                                    'text': text,
+                                                    'options': [],
+                                                    'answer': '',
+                                                    'images': [],
+                                                    'type': q_type
+                                                }
+                                            
+                                            # Deteksi opsi jawaban (A. B. C. dll atau A) B) C) dll)
+                                            elif RE_OPTION.match(text) and current_q:
+                                                option_text = RE_OPTION.sub('', text).strip()
+                                                if option_text:  # Only add non-empty options
+                                                    current_q['options'].append(option_text)
+                                            
+                                            # Deteksi jawaban
+                                            elif text.startswith('ANS:') and current_q:
+                                                current_q['answer'] = validate_answer_format(text)
+                                            
+                                            # PERBAIKAN #2: Deteksi gambar dengan validasi current_q
+                                            if '----image' in text and current_q:
+                                                img_refs = RE_IMAGE.findall(text)
+                                                for ref in img_refs:
+                                                    if ref in images_dict:
+                                                        current_q['images'].append((ref, images_dict[ref]))
+                                                        stats.total_images += 1
+                                                    else:
+                                                        warning = f"Image reference '{ref}' not found in document"
+                                                        stats.add_warning(warning)
+                                        
+                                        except Exception as e:
+                                            logger.warning(f"Error processing paragraph [{sheet_idx}][{table_idx}][{row_idx}][{cell_idx}][{para_idx}]: {str(e)}")
+                                            continue
                             
-                            if not text:
+                            except Exception as e:
+                                logger.warning(f"Error processing cell [{sheet_idx}][{table_idx}][{row_idx}][{cell_idx}]: {str(e)}")
                                 continue
-                            
-                            # Deteksi soal baru
-                            if not RE_OPTION.match(text) and not text.startswith('ANS:'):
-                                if current_q:
-                                    # Validasi soal sebelum append
-                                    if validate_question(current_q, stats):
-                                        questions.append(current_q)
-                                
-                                q_type = 'essay' if 'ESSAY' in text.upper() else 'multichoice'
-                                current_q = {
-                                    'text': text,
-                                    'options': [],
-                                    'answer': '',
-                                    'images': [],
-                                    'type': q_type
-                                }
-                            
-                            # Deteksi opsi jawaban
-                            elif RE_OPTION.match(text) and current_q:
-                                option_text = RE_OPTION.sub('', text).strip()
-                                if option_text:  # Only add non-empty options
-                                    current_q['options'].append(option_text)
-                            
-                            # Deteksi jawaban
-                            elif text.startswith('ANS:') and current_q:
-                                current_q['answer'] = validate_answer_format(text)
-                            
-                            # Deteksi gambar
-                            if '----image' in text and current_q:
-                                img_refs = RE_IMAGE.findall(text)
-                                for ref in img_refs:
-                                    if ref in images_dict:
-                                        current_q['images'].append((ref, images_dict[ref]))
-                                        stats.total_images += 1
-                                    else:
-                                        warning = f"Image reference '{ref}' not found in document"
-                                        stats.add_warning(warning)
+                    
+                    except Exception as e:
+                        logger.warning(f"Error processing table [{sheet_idx}][{table_idx}]: {str(e)}")
+                        continue
+            
+            except Exception as e:
+                logger.warning(f"Error processing sheet [{sheet_idx}]: {str(e)}")
+                continue
         
         # Append question terakhir
         if current_q and validate_question(current_q, stats):
@@ -266,6 +312,11 @@ def parse_docx_to_questions(
         stats.total_questions = len(questions)
         logger.info(f"Parsed {len(questions)} questions successfully")
         
+        if not questions:
+            raise ConversionError("No valid questions found after parsing")
+    
+    except ConversionError:
+        raise
     except Exception as e:
         error_msg = f"Error during question parsing: {str(e)}"
         stats.add_error(error_msg)
@@ -353,6 +404,8 @@ def process_docx_to_moodle(
                 
                 logger.info(f"Found {len(images_dict)} images in document")
         
+        except ConversionError:
+            raise
         except Exception as e:
             raise ConversionError(f"Failed to parse DOCX file: {str(e)}")
         
@@ -400,6 +453,7 @@ def process_docx_to_moodle(
                             f'<br /><img src="@@PLUGINFILE@@/{new_img_name}" '
                             f'alt="question image" border="0" /><br />'
                         )
+                        # PERBAIKAN #4: Replace dengan format yang sesuai regex
                         html_body = html_body.replace(f'----{img_name}----', img_html)
                         
                         file_node = ET.SubElement(
@@ -412,6 +466,7 @@ def process_docx_to_moodle(
                     except Exception as e:
                         warning = f"Failed to process image {img_name}: {str(e)}"
                         stats.add_warning(warning)
+                        logger.warning(warning)
                 
                 ET.SubElement(qtext_tag, 'text').text = cdata(html_body)
                 
@@ -457,10 +512,19 @@ def process_docx_to_moodle(
         # ============ FINALIZE XML ============
         try:
             raw_xml = ET.tostring(quiz, encoding='utf-8')
-            pretty_xml = minidom.parseString(raw_xml).toprettyxml(indent="  ")
+            
+            # PERBAIKAN #5: Tambah error handling untuk XML parsing
+            try:
+                pretty_xml = minidom.parseString(raw_xml).toprettyxml(indent="  ")
+            except Exception as e:
+                logger.warning(f"Minidom parsing failed: {str(e)}, using raw XML")
+                pretty_xml = raw_xml.decode('utf-8')
             
             # Validate generated XML
-            ET.fromstring(pretty_xml.encode('utf-8'))
+            try:
+                ET.fromstring(pretty_xml.encode('utf-8'))
+            except ET.ParseError as e:
+                logger.warning(f"Generated XML validation warning: {str(e)}")
             
             header_comment = (
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -469,7 +533,12 @@ def process_docx_to_moodle(
                 '\n'.format(stats.total_questions, stats.total_images)
             )
             
-            final_output = header_comment + pretty_xml.replace('<?xml version="1.0" ?>', '').strip()
+            # Clean up duplicate XML declaration
+            if isinstance(pretty_xml, bytes):
+                pretty_xml = pretty_xml.decode('utf-8')
+            
+            pretty_xml = pretty_xml.replace('<?xml version="1.0" ?>', '').strip()
+            final_output = header_comment + pretty_xml
             
             logger.info("XML generation successful")
             
@@ -479,8 +548,8 @@ def process_docx_to_moodle(
                 'success': True
             }
         
-        except ET.ParseError as e:
-            error_msg = f"Generated invalid XML: {str(e)}"
+        except Exception as e:
+            error_msg = f"Error during XML finalization: {str(e)}"
             stats.add_error(error_msg)
             raise ConversionError(error_msg)
     
