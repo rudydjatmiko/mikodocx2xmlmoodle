@@ -1,562 +1,395 @@
-import re
-import base64
-import io
-import xml.etree.ElementTree as ET
+"""
+Processor module untuk membaca dan parse DOCX file.
+Menampilkan isi dokumen secara lengkap dan terstruktur.
+"""
+
+import json
 import logging
-from typing import Dict, List, Tuple, Optional
-from docx2python import docx2python
-from PIL import Image
-from xml.dom import minidom
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, asdict
+from docx import Document
+from docx.oxml.text.paragraph import CT_P
+from docx.oxml.table import CT_Tbl
+from docx.table import Table, _Cell
+from docx.text.paragraph import Paragraph
 
 # ============ LOGGING SETUP ============
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ============ REGEX PATTERNS ============
-RE_OPTION = re.compile(r'^[A-E][\.\)]')
-RE_IMAGE = re.compile(r'----(image\d+(?:\.\w+)?(?:_\d+)?)----')
-RE_CLEAN_HTML = re.compile(r'<[^<]+?>')
-RE_SANITIZE_FILENAME = re.compile(r'[<>:"/\\|?*]')
-RE_INVALID_CHARS = re.compile(r'[<>&"\']')
 
-# ============ CONSTANTS ============
-MAX_IMAGE_WIDTH = 600
-MIN_IMAGE_WIDTH = 100
-IMAGE_QUALITY = 75
-MAX_CATEGORY_LENGTH = 100
-MAX_SNIPPET_LENGTH = 50
-MAX_OPTIONS = 5
-MIN_OPTIONS = 2
+@dataclass
+class DocxElement:
+    """Representasi element dalam DOCX"""
+    type: str  # 'paragraph', 'table', 'image', 'text', etc
+    content: str
+    style: Optional[str] = None
+    level: int = 0
 
-class ConversionError(Exception):
-    """Custom exception untuk conversion errors"""
-    pass
 
-class ConversionStats:
-    """Track conversion statistics"""
-    def __init__(self):
-        self.total_questions = 0
-        self.total_images = 0
-        self.warnings = []
-        self.errors = []
-    
-    def add_warning(self, message: str):
-        self.warnings.append(message)
-        logger.warning(message)
-    
-    def add_error(self, message: str):
-        self.errors.append(message)
-        logger.error(message)
-    
-    def to_dict(self):
-        return {
-            'total_questions': self.total_questions,
-            'total_images': self.total_images,
-            'warnings': self.warnings,
-            'errors': self.errors
-        }
+@dataclass
+class TableData:
+    """Representasi data tabel"""
+    rows: List[List[str]]
+    columns: int
+    rows_count: int
 
-def cdata(text: str) -> str:
-    """Wrapper untuk CDATA section"""
-    if not text:
-        return ""
-    return f"<![CDATA[{text}]]>"
 
-def optimize_image(
-    image_bytes: bytes, 
-    max_width: int = MAX_IMAGE_WIDTH,
-    stats: Optional[ConversionStats] = None
-) -> Tuple[bytes, str]:
-    """
-    Optimasi gambar dengan error handling yang comprehensive.
-    
-    Args:
-        image_bytes: Raw image data
-        max_width: Maximum width untuk resize
-        stats: ConversionStats object untuk tracking
-    
-    Returns:
-        Tuple(optimized_image_bytes, format_extension)
-    """
-    try:
-        if not image_bytes:
-            raise ValueError("Image bytes is empty")
-        
-        # Validate max_width
-        max_width = max(MIN_IMAGE_WIDTH, min(max_width, 2000))
-        
-        # Open image dari bytes
-        img = Image.open(io.BytesIO(image_bytes))
-        
-        # Handle berbagai image mode
-        if img.mode in ("RGBA", "LA"):
-            # Convert transparent ke white background
-            background = Image.new("RGB", img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
-            img = background
-        elif img.mode == "P":
-            img = img.convert("RGB")
-        elif img.mode in ("L", "1"):
-            # Grayscale dan binary
-            img = img.convert("RGB")
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
-        
-        # Resize jika perlu
-        if img.size[0] > max_width:
-            aspect_ratio = img.size[1] / img.size[0]
-            new_height = int(max_width * aspect_ratio)
-            new_height = max(1, new_height)  # Ensure height > 0
-            
-            img = img.resize(
-                (max_width, new_height),
-                Image.Resampling.LANCZOS
-            )
-        
-        # Save ke buffer dengan compression
-        buffer = io.BytesIO()
-        img.save(
-            buffer,
-            format="JPEG",
-            quality=IMAGE_QUALITY,
-            optimize=True
-        )
-        
-        result_bytes = buffer.getvalue()
-        
-        if not result_bytes:
-            raise ValueError("Failed to encode image to JPEG")
-        
-        logger.info(f"Image optimized: {len(image_bytes)} → {len(result_bytes)} bytes")
-        return result_bytes, "jpg"
-    
-    except Exception as e:
-        error_msg = f"Failed to optimize image: {str(e)}"
-        logger.error(error_msg)
-        
-        if stats:
-            stats.add_error(error_msg)
-        
-        # Return original bytes dengan format "png" sebagai fallback
-        return image_bytes, "png"
+@dataclass
+class DocumentContent:
+    """Hasil parsing dokumen lengkap"""
+    filename: str
+    elements: List[Dict[str, Any]]
+    total_paragraphs: int
+    total_tables: int
+    total_images: int
+    text_content: str
+    metadata: Dict[str, Any]
 
-def sanitize_filename(filename: str) -> str:
-    """Sanitize filename untuk keamanan"""
-    if not filename:
-        return "quiz"
-    
-    # Remove dangerous characters
-    safe_name = RE_SANITIZE_FILENAME.sub('_', filename)
-    
-    # Remove duplicate underscores
-    safe_name = re.sub(r'_+', '_', safe_name)
-    
-    # Limit length
-    safe_name = safe_name[:MAX_CATEGORY_LENGTH]
-    
-    # Remove trailing underscores
-    safe_name = safe_name.rstrip('_')
-    
-    return safe_name or "quiz"
 
-def sanitize_text(text: str, max_length: Optional[int] = None) -> str:
+class DocxProcessor:
     """
-    Sanitize text content untuk XML.
+    Processor untuk membaca dan parse file DOCX.
     
-    PERBAIKAN #3: Konversi object ke string dan hapus karakter XML invalid
+    Features:
+    - Extract paragraf dengan formatting
+    - Extract tabel dengan struktur lengkap
+    - Extract gambar
+    - Extract metadata
+    - Support nested elements
     """
-    if not text:
-        return ""
     
-    # PERBAIKAN: Convert ke string jika object (dari docx2python)
-    text = str(text).strip()
-    
-    # Skip jika hanya whitespace
-    if not text or text.isspace():
-        return ""
-    
-    # PERBAIKAN: Remove invalid XML characters (< > & " ')
-    # tapi keep angka, huruf, spasi, dan tanda baca umum
-    text = RE_INVALID_CHARS.sub('', text)
-    
-    if max_length:
-        text = text[:max_length]
-    
-    return text.strip()
-
-def validate_answer_format(answer_str: str) -> str:
-    """
-    Validasi dan normalize format jawaban.
-    
-    Input: "ANS: A, B", "A,B", "AB", etc
-    Output: "AB" (uppercase letters A-E only)
-    """
-    if not answer_str:
-        return ""
-    
-    # Remove "ANS:" prefix jika ada
-    answer_str = answer_str.replace("ANS:", "").replace("ans:", "").strip()
-    
-    # Extract hanya huruf A-E
-    valid_answers = ''.join(
-        c.upper() for c in answer_str 
-        if c.upper() in 'ABCDE'
-    )
-    
-    return valid_answers
-
-def parse_docx_to_questions(
-    content,
-    images_dict: Dict,
-    stats: ConversionStats
-) -> List[Dict]:
-    """
-    Parse DOCX content ke struktur questions.
-    
-    PERBAIKAN: 
-    - Handle berbagai struktur DOCX
-    - Robust error handling untuk malformed content
-    
-    Returns:
-        List of question dictionaries
-    """
-    questions = []
-    current_q = None
-    
-    try:
-        for sheet_idx, sheet in enumerate(content):
-            try:
-                for table_idx, table in enumerate(sheet):
-                    try:
-                        for row_idx, row in enumerate(table):
-                            try:
-                                for cell_idx, cell in enumerate(row):
-                                    # PERBAIKAN: Handle berbagai tipe cell content
-                                    if cell is None:
-                                        continue
-                                    
-                                    # Iterasi paragraf dalam cell
-                                    try:
-                                        paragraphs = cell if isinstance(cell, (list, tuple)) else [cell]
-                                    except (TypeError, ValueError):
-                                        paragraphs = [cell]
-                                    
-                                    for para_idx, paragraph in enumerate(paragraphs):
-                                        try:
-                                            # PERBAIKAN #1: Convert object ke string
-                                            text = sanitize_text(paragraph)
-                                            
-                                            if not text:
-                                                continue
-                                            
-                                            # Deteksi soal baru (bukan opsi dan bukan jawaban)
-                                            if not RE_OPTION.match(text) and not text.startswith('ANS:'):
-                                                if current_q:
-                                                    # Validasi soal sebelum append
-                                                    if validate_question(current_q, stats):
-                                                        questions.append(current_q)
-                                                
-                                                q_type = 'essay' if 'ESSAY' in text.upper() else 'multichoice'
-                                                current_q = {
-                                                    'text': text,
-                                                    'options': [],
-                                                    'answer': '',
-                                                    'images': [],
-                                                    'type': q_type
-                                                }
-                                            
-                                            # Deteksi opsi jawaban (A. B. C. dll atau A) B) C) dll)
-                                            elif RE_OPTION.match(text) and current_q:
-                                                option_text = RE_OPTION.sub('', text).strip()
-                                                if option_text:  # Only add non-empty options
-                                                    current_q['options'].append(option_text)
-                                            
-                                            # Deteksi jawaban
-                                            elif text.startswith('ANS:') and current_q:
-                                                current_q['answer'] = validate_answer_format(text)
-                                            
-                                            # PERBAIKAN #2: Deteksi gambar dengan validasi current_q
-                                            if '----image' in text and current_q:
-                                                img_refs = RE_IMAGE.findall(text)
-                                                for ref in img_refs:
-                                                    if ref in images_dict:
-                                                        current_q['images'].append((ref, images_dict[ref]))
-                                                        stats.total_images += 1
-                                                    else:
-                                                        warning = f"Image reference '{ref}' not found in document"
-                                                        stats.add_warning(warning)
-                                        
-                                        except Exception as e:
-                                            logger.warning(f"Error processing paragraph [{sheet_idx}][{table_idx}][{row_idx}][{cell_idx}][{para_idx}]: {str(e)}")
-                                            continue
-                            
-                            except Exception as e:
-                                logger.warning(f"Error processing cell [{sheet_idx}][{table_idx}][{row_idx}][{cell_idx}]: {str(e)}")
-                                continue
-                    
-                    except Exception as e:
-                        logger.warning(f"Error processing table [{sheet_idx}][{table_idx}]: {str(e)}")
-                        continue
-            
-            except Exception as e:
-                logger.warning(f"Error processing sheet [{sheet_idx}]: {str(e)}")
-                continue
+    def __init__(self, file_path: str):
+        """
+        Initialize processor dengan file path.
         
-        # Append question terakhir
-        if current_q and validate_question(current_q, stats):
-            questions.append(current_q)
+        Args:
+            file_path: Path ke file DOCX
+        """
+        self.file_path = Path(file_path)
+        self.document = None
+        self.elements: List[Dict[str, Any]] = []
+        self.images: List[Dict[str, Any]] = []
+        self.tables: List[TableData] = []
         
-        stats.total_questions = len(questions)
-        logger.info(f"Parsed {len(questions)} questions successfully")
+        self._validate_file()
+    
+    def _validate_file(self) -> None:
+        """Validasi file DOCX"""
+        if not self.file_path.exists():
+            raise FileNotFoundError(f"File tidak ditemukan: {self.file_path}")
         
-        if not questions:
-            raise ConversionError("No valid questions found after parsing")
-    
-    except ConversionError:
-        raise
-    except Exception as e:
-        error_msg = f"Error during question parsing: {str(e)}"
-        stats.add_error(error_msg)
-        raise ConversionError(error_msg)
-    
-    return questions
-
-def validate_question(question: Dict, stats: ConversionStats) -> bool:
-    """
-    Validasi struktur question.
-    
-    Returns:
-        True jika question valid, False jika ada issue
-    """
-    if not question.get('text'):
-        stats.add_warning("Question has empty text")
-        return False
-    
-    if question['type'] == 'multichoice':
-        # Multichoice harus punya minimal 2 opsi
-        if len(question['options']) < MIN_OPTIONS:
-            warning = f"Multichoice question has only {len(question['options'])} options (min {MIN_OPTIONS})"
-            stats.add_warning(warning)
-            return False
+        if self.file_path.suffix.lower() != '.docx':
+            raise ValueError(f"File harus berformat DOCX, bukan {self.file_path.suffix}")
         
-        # Multichoice tidak boleh lebih dari 5 opsi
-        if len(question['options']) > MAX_OPTIONS:
-            warning = f"Multichoice question has {len(question['options'])} options (max {MAX_OPTIONS}), truncating"
-            stats.add_warning(warning)
-            question['options'] = question['options'][:MAX_OPTIONS]
-        
-        # Harus punya jawaban
-        if not question['answer']:
-            stats.add_warning("Multichoice question has no answer")
-            return False
+        logger.info(f"File valid: {self.file_path}")
     
-    return True
-
-def process_docx_to_moodle(
-    docx_file_bytes: bytes,
-    filename: str = "QUIZ"
-) -> Dict:
-    """
-    Proses DOCX file menjadi Moodle XML format.
-    
-    Args:
-        docx_file_bytes: Raw DOCX file bytes
-        filename: Original filename (untuk category name)
-    
-    Returns:
-        Dictionary dengan keys:
-            - 'xml': XML string result
-            - 'stats': ConversionStats dictionary
-            - 'success': Boolean status
-    
-    Raises:
-        ConversionError: Jika terjadi error critical
-    """
-    stats = ConversionStats()
-    
-    try:
-        # ============ INPUT VALIDATION ============
-        if not docx_file_bytes:
-            raise ConversionError("DOCX file bytes is empty")
+    def process(self) -> DocumentContent:
+        """
+        Proses file DOCX dan return hasil lengkap.
         
-        if len(docx_file_bytes) < 100:
-            raise ConversionError("DOCX file is too small (possibly corrupted)")
-        
-        # Validate DOCX magic bytes (PK = ZIP format)
-        if not docx_file_bytes.startswith(b'PK'):
-            raise ConversionError("File is not a valid DOCX (invalid magic bytes)")
-        
-        # ============ EXTRACT CATEGORY NAME ============
-        category_name = sanitize_filename(filename.rsplit('.', 1)[0])
-        logger.info(f"Category name: {category_name}")
-        
-        # ============ PARSE DOCX ============
+        Returns:
+            DocumentContent dengan semua isi dokumen
+        """
         try:
-            with docx2python(docx_file_bytes, html=True) as doc_content:
-                content = doc_content.body
-                images_dict = doc_content.images
-                
-                if not content:
-                    raise ConversionError("DOCX file has no content")
-                
-                logger.info(f"Found {len(images_dict)} images in document")
+            self.document = Document(self.file_path)
+            logger.info("Dokumen berhasil dibuka")
+            
+            # Process semua element
+            self._extract_elements()
+            
+            # Extract metadata
+            metadata = self._extract_metadata()
+            
+            # Kumpulkan text content
+            text_content = self._get_full_text()
+            
+            result = DocumentContent(
+                filename=self.file_path.name,
+                elements=self.elements,
+                total_paragraphs=len([e for e in self.elements if e['type'] == 'paragraph']),
+                total_tables=len(self.tables),
+                total_images=len(self.images),
+                text_content=text_content,
+                metadata=metadata
+            )
+            
+            logger.info(f"Processing selesai: {result.total_paragraphs} paragraf, "
+                       f"{result.total_tables} tabel, {result.total_images} gambar")
+            
+            return result
         
-        except ConversionError:
+        except Exception as e:
+            logger.error(f"Error saat processing: {str(e)}", exc_info=True)
             raise
-        except Exception as e:
-            raise ConversionError(f"Failed to parse DOCX file: {str(e)}")
-        
-        # ============ CREATE ROOT XML ============
-        quiz = ET.Element('quiz')
-        
-        # Add category
-        cat_q = ET.SubElement(quiz, 'question', type='category')
-        cat_node = ET.SubElement(cat_q, 'category')
-        ET.SubElement(cat_node, 'text').text = f"$course$/{category_name}"
-        
-        # ============ PARSE QUESTIONS ============
-        questions = parse_docx_to_questions(content, images_dict, stats)
-        
-        if not questions:
-            raise ConversionError("No valid questions found in DOCX")
-        
-        # ============ BUILD XML STRUCTURE ============
-        q_counter = 1
-        
-        for q in questions:
-            try:
-                q_node = ET.SubElement(quiz, 'question', type=q['type'])
-                
-                q_id = f"q{str(q_counter).zfill(3)}"
-                pure_text = RE_CLEAN_HTML.sub('', q['text'])
-                clean_snippet = pure_text[:MAX_SNIPPET_LENGTH].strip()
-                
-                # Build question name
-                name_node = ET.SubElement(q_node, 'name')
-                ET.SubElement(name_node, 'text').text = cdata(
-                    f"{category_name} {q_id} {clean_snippet}"
-                )
-                
-                # Build question text
-                qtext_tag = ET.SubElement(q_node, 'questiontext', format='html')
-                html_body = f"<p dir='auto'>{q['text']}</p>"
-                
-                # Process images
-                for img_name, img_bytes in q['images']:
-                    try:
-                        opt_bytes, ext = optimize_image(img_bytes, MAX_IMAGE_WIDTH, stats)
-                        new_img_name = f"{q_id}_{img_name.split('.')[0]}.{ext}"
-                        img_html = (
-                            f'<br /><img src="@@PLUGINFILE@@/{new_img_name}" '
-                            f'alt="question image" border="0" /><br />'
-                        )
-                        # PERBAIKAN #4: Replace dengan format yang sesuai regex
-                        html_body = html_body.replace(f'----{img_name}----', img_html)
-                        
-                        file_node = ET.SubElement(
-                            qtext_tag, 'file',
-                            name=new_img_name,
-                            encoding="base64"
-                        )
-                        file_node.text = base64.b64encode(opt_bytes).decode()
-                    
-                    except Exception as e:
-                        warning = f"Failed to process image {img_name}: {str(e)}"
-                        stats.add_warning(warning)
-                        logger.warning(warning)
-                
-                ET.SubElement(qtext_tag, 'text').text = cdata(html_body)
-                
-                # Default settings
-                ET.SubElement(q_node, 'defaultgrade').text = "1.0"
-                
-                # Type-specific settings
-                if q['type'] == 'multichoice':
-                    ET.SubElement(q_node, 'penalty').text = "0.33"
-                    ET.SubElement(q_node, 'hidden').text = "0"
-                    ET.SubElement(q_node, 'single').text = "true"
-                    ET.SubElement(q_node, 'shuffleanswers').text = "true"
-                    ET.SubElement(q_node, 'answernumbering').text = "abc"
-                    
-                    letters = ['A', 'B', 'C', 'D', 'E']
-                    for i, opt in enumerate(q['options']):
-                        if i >= len(letters):
-                            break
-                        
-                        is_correct = "100.0" if letters[i] in q['answer'] else "0.0"
-                        ans_node = ET.SubElement(
-                            q_node, 'answer',
-                            fraction=is_correct,
-                            format="html"
-                        )
-                        ET.SubElement(ans_node, 'text').text = cdata(opt)
-                
-                elif q['type'] == 'essay':
-                    ET.SubElement(q_node, 'penalty').text = "0.1"
-                    ET.SubElement(q_node, 'responseformat').text = "editor"
-                    ET.SubElement(q_node, 'responserequired').text = "1"
-                    ET.SubElement(q_node, 'responsefieldlines').text = "15"
-                    ET.SubElement(q_node, 'attachments').text = "0"
-                
-                q_counter += 1
-            
-            except Exception as e:
-                error_msg = f"Error processing question {q_counter}: {str(e)}"
-                stats.add_error(error_msg)
-                logger.error(error_msg)
-                continue
-        
-        # ============ FINALIZE XML ============
-        try:
-            raw_xml = ET.tostring(quiz, encoding='utf-8')
-            
-            # PERBAIKAN #5: Tambah error handling untuk XML parsing
-            try:
-                pretty_xml = minidom.parseString(raw_xml).toprettyxml(indent="  ")
-            except Exception as e:
-                logger.warning(f"Minidom parsing failed: {str(e)}, using raw XML")
-                pretty_xml = raw_xml.decode('utf-8')
-            
-            # Validate generated XML
-            try:
-                ET.fromstring(pretty_xml.encode('utf-8'))
-            except ET.ParseError as e:
-                logger.warning(f"Generated XML validation warning: {str(e)}")
-            
-            header_comment = (
-                '<?xml version="1.0" encoding="UTF-8"?>\n'
-                '<!-- Generated by Docx2Moodle Converter -->\n'
-                '<!-- Questions: {} | Images: {} -->\n'
-                '\n'.format(stats.total_questions, stats.total_images)
-            )
-            
-            # Clean up duplicate XML declaration
-            if isinstance(pretty_xml, bytes):
-                pretty_xml = pretty_xml.decode('utf-8')
-            
-            pretty_xml = pretty_xml.replace('<?xml version="1.0" ?>', '').strip()
-            final_output = header_comment + pretty_xml
-            
-            logger.info("XML generation successful")
-            
-            return {
-                'xml': final_output,
-                'stats': stats.to_dict(),
-                'success': True
-            }
-        
-        except Exception as e:
-            error_msg = f"Error during XML finalization: {str(e)}"
-            stats.add_error(error_msg)
-            raise ConversionError(error_msg)
     
-    except ConversionError:
-        raise
-    except Exception as e:
-        error_msg = f"Unexpected error during conversion: {str(e)}"
-        stats.add_error(error_msg)
-        logger.error(error_msg, exc_info=True)
-        raise ConversionError(error_msg)
+    def _extract_elements(self) -> None:
+        """Extract semua elements dari dokumen"""
+        for block in self.document.element.body:
+            if isinstance(block, CT_P):
+                self._process_paragraph(block)
+            elif isinstance(block, CT_Tbl):
+                self._process_table(block)
+    
+    def _process_paragraph(self, para_element: CT_P) -> None:
+        """
+        Process paragraph element.
+        
+        Args:
+            para_element: CT_P element dari dokumen
+        """
+        try:
+            para = Paragraph(para_element, self.document.element.body.getparent())
+            
+            # Extract text
+            text = para.text.strip()
+            
+            if not text:
+                return
+            
+            # Extract formatting
+            style = para.style.name if para.style else "Normal"
+            level = para.paragraph_format.outline_level or 0
+            
+            # Extract runs untuk detail formatting
+            runs_info = []
+            for run in para.runs:
+                run_data = {
+                    'text': run.text,
+                    'bold': run.bold,
+                    'italic': run.italic,
+                    'underline': run.underline,
+                    'font_name': run.font.name,
+                    'font_size': run.font.size.pt if run.font.size else None,
+                }
+                runs_info.append(run_data)
+            
+            element_dict = {
+                'type': 'paragraph',
+                'content': text,
+                'style': style,
+                'level': level,
+                'runs': runs_info,
+                'alignment': str(para.alignment) if para.alignment else 'left',
+                'space_before': para.paragraph_format.space_before,
+                'space_after': para.paragraph_format.space_after,
+            }
+            
+            # Extract images dari paragraph
+            self._extract_images_from_paragraph(para, element_dict)
+            
+            self.elements.append(element_dict)
+        
+        except Exception as e:
+            logger.warning(f"Error processing paragraph: {str(e)}")
+    
+    def _process_table(self, table_element: CT_Tbl) -> None:
+        """
+        Process table element.
+        
+        Args:
+            table_element: CT_Tbl element dari dokumen
+        """
+        try:
+            table = Table(table_element, self.document.element.body.getparent())
+            
+            rows_data = []
+            for row_idx, row in enumerate(table.rows):
+                row_data = []
+                for col_idx, cell in enumerate(row.cells):
+                    cell_content = self._extract_cell_content(cell)
+                    row_data.append(cell_content)
+                rows_data.append(row_data)
+            
+            table_dict = {
+                'type': 'table',
+                'rows': rows_data,
+                'rows_count': len(table.rows),
+                'columns_count': len(table.columns),
+                'content': self._table_to_string(rows_data),
+            }
+            
+            self.elements.append(table_dict)
+            self.tables.append(TableData(
+                rows=rows_data,
+                columns=len(table.columns),
+                rows_count=len(table.rows)
+            ))
+        
+        except Exception as e:
+            logger.warning(f"Error processing table: {str(e)}")
+    
+    def _extract_cell_content(self, cell: _Cell) -> str:
+        """
+        Extract content dari cell.
+        
+        Args:
+            cell: Cell dari tabel
+            
+        Returns:
+            Text content dari cell
+        """
+        content = []
+        for paragraph in cell.paragraphs:
+            text = paragraph.text.strip()
+            if text:
+                content.append(text)
+        
+        return "\n".join(content) if content else ""
+    
+    def _table_to_string(self, rows_data: List[List[str]]) -> str:
+        """
+        Convert tabel ke string representation.
+        
+        Args:
+            rows_data: Data baris tabel
+            
+        Returns:
+            String representation tabel
+        """
+        if not rows_data:
+            return ""
+        
+        # Hitung lebar kolom
+        col_widths = []
+        for col_idx in range(len(rows_data[0])):
+            max_width = max(len(str(row[col_idx])) for row in rows_data)
+            col_widths.append(max_width + 2)
+        
+        # Build string
+        lines = []
+        for row_idx, row in enumerate(rows_data):
+            cells = []
+            for col_idx, cell in enumerate(row):
+                cell_str = str(cell).ljust(col_widths[col_idx])
+                cells.append(cell_str)
+            
+            line = "|" + "|".join(cells) + "|"
+            lines.append(line)
+            
+            # Add separator setelah header row
+            if row_idx == 0:
+                separator = "+" + "+".join(["-" * width for width in col_widths]) + "+"
+                lines.insert(0, separator)
+                lines.append(separator)
+        
+        lines.append(separator)
+        return "\n".join(lines)
+    
+    def _extract_images_from_paragraph(self, para: Paragraph, element_dict: Dict) -> None:
+        """
+        Extract images dari paragraph.
+        
+        Args:
+            para: Paragraph element
+            element_dict: Dictionary untuk menyimpan info image
+        """
+        images_in_para = []
+        
+        for run in para.runs:
+            for rel in run._element.getparent().iter():
+                if 'drawing' in rel.tag or 'image' in rel.tag:
+                    images_in_para.append({
+                        'type': 'inline_image',
+                        'tag': rel.tag
+                    })
+        
+        if images_in_para:
+            element_dict['images'] = images_in_para
+            self.images.extend(images_in_para)
+    
+    def _extract_metadata(self) -> Dict[str, Any]:
+        """
+        Extract metadata dari dokumen.
+        
+        Returns:
+            Dictionary berisi metadata
+        """
+        try:
+            core_props = self.document.core_properties
+            
+            metadata = {
+                'title': core_props.title or "N/A",
+                'subject': core_props.subject or "N/A",
+                'author': core_props.author or "N/A",
+                'created': str(core_props.created) if core_props.created else "N/A",
+                'modified': str(core_props.modified) if core_props.modified else "N/A",
+                'comments': core_props.comments or "N/A",
+                'keywords': core_props.keywords or "N/A",
+            }
+            
+            return metadata
+        
+        except Exception as e:
+            logger.warning(f"Error extracting metadata: {str(e)}")
+            return {}
+    
+    def _get_full_text(self) -> str:
+        """
+        Ambil seluruh text content dari dokumen.
+        
+        Returns:
+            Full text content
+        """
+        full_text = []
+        
+        for element in self.elements:
+            if element['type'] == 'paragraph':
+                full_text.append(element['content'])
+            elif element['type'] == 'table':
+                full_text.append(element['content'])
+        
+        return "\n\n".join(full_text)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert hasil processing ke dictionary"""
+        result = self.process()
+        return {
+            'filename': result.filename,
+            'elements': result.elements,
+            'summary': {
+                'total_paragraphs': result.total_paragraphs,
+                'total_tables': result.total_tables,
+                'total_images': result.total_images,
+            },
+            'metadata': result.metadata,
+            'full_text': result.text_content,
+        }
+    
+    def to_json(self, output_path: Optional[str] = None) -> str:
+        """
+        Export hasil ke JSON.
+        
+        Args:
+            output_path: Path untuk menyimpan JSON (optional)
+            
+        Returns:
+            JSON string
+        """
+        data = self.to_dict()
+        json_str = json.dumps(data, indent=2, ensure_ascii=False)
+        
+        if output_path:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+            logger.info(f"JSON exported ke: {output_path}")
+        
+        return json_str
+
+
+def process_docx_file(file_path: str) -> DocumentContent:
+    """
+    Helper function untuk process file DOCX.
+    
+    Args:
+        file_path: Path ke file DOCX
+        
+    Returns:
+        DocumentContent dengan hasil parsing
+    """
+    processor = DocxProcessor(file_path)
+    return processor.process()
