@@ -1,3 +1,2 @@
+python-docx
 streamlit
-docx2python
-Pillow
